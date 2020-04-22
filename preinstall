@@ -1,0 +1,466 @@
+#!/bin/sh
+
+GLOBAL_APP_PATH="/Applications/zoom.us.app"
+USER_APP_PATH=~/Applications/zoom.us.app
+GLOBAL_APP_FOLDER="/Applications"
+USER_APP_FOLDER=~/Applications
+LOG_PATH=~/Library/Logs/zoominstall.log
+SAVED_STATE_FILE=~/Library/Saved\ Application\ State/com.apple.installer.savedState/windows.plist
+ALIAS_FILE_PATH=~/Desktop/Zoom
+OLD_APP_TITLE="Zoom"
+APP_TITLE="zoom.us"
+
+rm -f "$LOG_PATH"
+p=$(/usr/bin/printenv PATH)
+echo "["$(date)"]path: $p">"$LOG_PATH"
+
+if [[ $? != 0 ]] ; then
+    LOG_PATH=/tmp/zoominstall.log
+    rm -f "$LOG_PATH"
+    echo "[$(date)]path: $p">"$LOG_PATH"
+
+    if [[ $? != 0 ]] ; then
+        LOG_PATH=/dev/null
+    fi
+fi
+
+if [[ $p = *usr\/bin* ]] ; then
+	echo "The path includes /usr/bin.">>"$LOG_PATH"
+else
+	PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+fi
+
+p=$(/usr/bin/printenv PATH)
+echo "path new: $p">>"$LOG_PATH"
+
+w=$(whereis whoami)
+echo "check whereis:$w">>"$LOG_PATH"
+
+u=$(whereis unzip)
+echo "check unzip:$u">>"$LOG_PATH"
+
+osver=$(sw_vers)
+echo "os ver: $osver">>"$LOG_PATH"
+
+a=$(whoami 2>&1)
+r=$?
+if [ $r != 0 ] ; then
+	echo "get user name error: $r">>"$LOG_PATH"
+	a = $(/usr/bin/whoami 2>&1)
+fi
+
+GLOBAL_DOCK_PATH="file:///Applications/zoom.us.app/"
+USER_DOCK_PATH="file:///Users/$a/Applications/zoom.us.app/"
+
+checkUser=$(dsmemberutil checkmembership -U "$a" -G "admin")
+isAdmin=0
+isAdminUser=$(echo "$checkUser" | grep "is a member")
+len=$(expr "$isAdminUser" : ".*")
+echo "check admin:$a, $isAdmin, $checkUser, $isAdminUser, $len">>"$LOG_PATH"
+
+###########################
+#verify codesign
+function codesign_verify(){
+    codesign -v --verbose=4 "$APP_PATH" 2>>"$LOG_PATH"
+    if [[ $? == 0 ]] ; then
+        identifier="us.zoom.xos"
+        team_id="BJ4HAAB9B3"
+        codesign --verify -R=" identifier = \"$identifier\" and anchor apple generic and certificate leaf[subject.OU] = \"$team_id\"" "$APP_PATH"
+
+        if [[ $? != 0 ]] ; then
+            rm -rf "$APP_PATH"
+            echo "["$(date)"]codesign verify failed with -vv -d ">>"$LOG_PATH"
+            exit 6
+        fi
+    else
+        echo "["$(date)"]codesign verify failed with -v --verbose=4 ">>"$LOG_PATH"
+        rm -rf "$APP_PATH"
+        exit 7
+    fi
+    echo "["$(date)"]codesign verified###########################">>"$LOG_PATH"
+}
+
+
+###########################
+#verify MD5 checksum
+function md_verify(){
+    find "$APP_PATH" -name ".DS_Store" | sed 's/ /\\ /' | xargs rm
+    md=$(find "$APP_PATH" -type f -name "*" -exec md5 {} + | awk '{if( $3=="=" ) {print $4} else {print $5}}' | sort | md5)
+    mdf=$(cat zoomus.md5)
+
+    if [[ "$md" == "$mdf" ]] ; then
+        echo "["$(date)"]Data verify is OK">>"$LOG_PATH"
+    else
+        echo "["$(date)"]Data verify failed $md  $mdf">>"$LOG_PATH"
+        rm -rf "$APP_PATH"
+        exit 5
+    fi
+}
+
+#check if ITPackage installed then only launch it{
+function kill_installer()
+{
+    installer_pid=$(ps -x -o pid -o command | grep "/System/Library/CoreServices/Installer.app"\
+    | while read each_p
+    do
+        echo "$each_p"
+    done \
+    | grep "MacOS" | cut -d " " -f 1)
+
+    echo "installer pid: $installer_pid">>"$LOG_PATH"
+    echo "["$(date)"]installer saved state: $SAVED_STATE_FILE">>"$LOG_PATH"
+
+    if [[ -f  $SAVED_STATE_FILE ]] ; then
+        rm -rf "$SAVED_STATE_FILE"
+        ret=$?
+        echo "file exist, delete it: $ret">>"$LOG_PATH"
+    fi
+
+    if [ $installer_pid > 0 ] ; then
+        kill -9 $installer_pid
+    else
+        installer_pid=$(ps -ef | grep "/System/Library/CoreServices/Installer.app"\
+        | while read each_p
+        do
+            echo "$each_p"
+        done \
+        | grep "MacOS" | cut -d " " -f 2)
+
+        echo "installer pid 2: $installer_pid">>"$LOG_PATH"
+        kill -9 $installer_pid
+
+        installer_pid=$(ps -ef | grep "/System/Library/CoreServices/Installer.app"\
+        | while read each_p
+        do
+            echo "$each_p"
+        done \
+        | grep "MacOS" | cut -d " " -f 3)
+
+        echo "installer pid 3: $installer_pid">>"$LOG_PATH"
+        kill -9 $installer_pid
+    fi
+}
+
+function killzoom(){
+    #for multi meeting
+    killall -9 zoom.us
+    old_app_pid=$(ps -x -o pid -o command | grep "zoom.us.app" \
+    | while read each_p
+    do
+        echo "$each_p"
+    done \
+    | grep "MacOS" | cut -d " " -f 1)
+
+    echo "get running zoom.us.app id: $app_pid">>"$LOG_PATH"
+    if [ $old_app_pid > 0 ] ; then
+        kill -9 $old_app_pid
+    fi
+
+    #kill Zoom.app
+    app_pid=$(ps -x -o pid -o command | grep "Zoom.app" \
+    | while read each_p
+    do
+        echo "$each_p"
+    done \
+    | grep "MacOS" | cut -d " " -f 1)
+
+    echo "get running Zoom.app id: $app_pid">>"$LOG_PATH"
+    if [ $app_pid > 0 ] ; then
+        kill -9 $app_pid
+    fi
+}
+
+#create dock icon with dockutil
+function keepIconInDock(){
+    echo "=========================create dock icon with dockutil">>"$LOG_PATH"
+    shouldAddIcon=0
+    IconPosition="end"
+    resultString=`./dockutil --find us.zoom.xos`
+    if [ $? = 0 ] ; then
+        arr=($resultString)
+        itemIndex=1
+        itemIndex=${arr[7]}
+        itemIndex=$((itemIndex-1))
+        DOCK_PLIST=~/Library/Preferences/com.apple.dock.plist
+        dockItemLauchPath=`/usr/libexec/PlistBuddy -c "print persistent-apps:$itemIndex:tile-data:file-data:_CFURLString" $DOCK_PLIST`
+        echo "find old zoom icon">>"$LOG_PATH"
+        echo $dockItemLauchPath >>"$LOG_PATH"
+#       remainString=${dockItemLauchPath/${APP_PATH}/}
+#        dockItemPathLength=`echo $dockItemLauchPath | wc -c`
+#        remainLength=`echo $remainString | wc -c`
+#        appathLength=`echo $APP_PATH | wc -c`
+#        choppedLength=$((dockItemPathLength-remainLength+1))
+#        result=$((choppedLength-appathLength))
+        if [[ "$DOCK_APPPATH" == "$dockItemLauchPath" ]] ; then
+            echo "Dock icon had been installed before">>"$LOG_PATH"
+        else
+            echo "Dock icon had been installed before, need to be replace">>"$LOG_PATH"
+            shouldAddIcon=1
+            IconPosition=${arr[7]}
+        fi
+    else
+        shouldAddIcon=0
+    fi
+    if [[ $shouldAddIcon = 1 ]] ; then
+        #remove zoom.us installed in other folder
+        ./dockutil --remove 'zoom.us' --allhomes --no-restart>>"$LOG_PATH"
+        ./dockutil --add "$APP_PATH" --position $IconPosition --allhomes >>"$LOG_PATH"
+        sleep 1
+    fi
+}
+###################################
+function install_app_to_path(){
+#path=$1
+    InstallPath="$1/.zoomus_"$(date)""
+    mkdir -p "$InstallPath"
+    mkdir -p "$InstallPath/Frameworks"
+    if [[ $? != 0 ]] ; then
+        rm -rf "$InstallPath"
+        return 1
+    fi
+
+    if [[ -d "$1/zoom.us.app" ]] ; then
+        rm -f "$1/zoom.us.app/Contents/Info.plist"
+        mv "$1/zoom.us.app/Contents" "$InstallPath/trash"
+    fi
+
+    if [[ $? != 0 ]] ; then
+        rm -rf "$InstallPath"
+        return 4
+    fi
+
+    rm -rf "$1/zoom.us.app"
+    if [[ $? != 0 ]] ; then
+        rm -rf "$InstallPath"
+        return 4
+    fi
+
+    mdfind 'kMDItemCFBundleIdentifier == "us.zoom.xos"'> .zoom.us.applist.txt
+
+    echo "["$(date)"]un7z zm.7z =================================" >>"$LOG_PATH"
+    if [[ -f res.7z ]] ; then
+        ./7zr x -mmt ./res.7z -o"$InstallPath/Frameworks"&
+    fi
+
+    if [[ -f resReitna.7z ]] ; then
+        ./7zr x -mmt ./resReitna.7z -o"$InstallPath/Frameworks"&
+    fi
+
+    if [[ -f bundles.7z ]] ; then
+        ./7zr x -mmt ./bundles.7z -o"$InstallPath/Frameworks"&
+    fi
+
+    un7zresult=$(./7zr x -mmt ./zm.7z -o"$InstallPath" 2>>"$LOG_PATH")
+    ret=$?
+    echo "["$(date)"]check un7z return:$ret, $un7zresult">>"$LOG_PATH"
+    wait
+    echo "["$(date)"]un7z all finished">>"$LOG_PATH"
+    if [[ $ret != 0 ]] ; then
+        rm -rf "$InstallPath"
+        return 3
+    fi
+
+    mv "$InstallPath/Frameworks/"* "$InstallPath/zoom.us.app/Contents/Frameworks">>"$LOG_PATH"
+    mv "$InstallPath/zoom.us.app" "$1" >>"$LOG_PATH"
+    if [[ $? != 0 ]] ; then
+        rm -rf "$InstallPath"
+        return 1
+    fi
+
+    if [[ "$APP_PATH" == "$GLOBAL_APP_PATH" ]] ; then
+        chmod -R 775 "$APP_PATH"
+        chown -R :admin "$APP_PATH"
+    fi
+
+    echo "["$(date)"]mv $InstallPath/zoom.us.app into $1">>"$LOG_PATH"
+
+    rm -rf "$InstallPath"&
+    return 0
+}
+
+function askforITPackage(){
+x=`/usr/bin/osascript <<EOT
+tell application "Installer"
+activate
+set myReply to button returned of (display dialog "Your Zoom application is being managed by your IT administrator. Please contact your IT administrator to request an update." buttons {"Quit", "Launch Zoom"} with icon 1 with title "Install Zoom")
+end tell
+EOT`
+    echo "askforITPackage: ret=$x" >> $LOG_PATH
+    if [[ $x = "Quit" ]]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+ret=`/usr/libexec/PlistBuddy -c "print ZITPackage" /Applications/zoom.us.app/Contents/Info.plist`
+echo $ret
+if [[ $ret = true ]] ; then
+    echo "ZITPackage had been installed launch zoom.us.app instead intall. If need install this package please delete /Applications/zoom.us.app first">>$LOG_PATH
+    askforITPackage
+    if [[ $? = 0 ]] ; then
+        open "/Applications/zoom.us.app"
+    fi
+    kill_installer
+    exit 0
+else
+    echo "no ZITPackage installed">>"$LOG_PATH"
+fi
+
+#}
+if [[ $checkUser = *is\ a\ member* ]] ; then
+		APP_PATH="$GLOBAL_APP_PATH"
+		APP_FOLDER="$GLOBAL_APP_FOLDER"
+		DOCK_APPPATH="$GLOBAL_DOCK_PATH"
+		isAdmin=1
+else
+		if [[ ! -d  "$USER_APP_FOLDER" ]] ; then
+    		mkdir -p "$USER_APP_FOLDER"
+            echo "$USER_APP_FOLDER:create folder , use it">>"$LOG_PATH"
+        else
+            echo "$USER_APP_FOLDER:folder exists, use it">>"$LOG_PATH"
+		fi
+		
+		APP_PATH="$USER_APP_PATH"
+		APP_FOLDER="$USER_APP_FOLDER"
+		DOCK_APPPATH="$USER_DOCK_PATH"
+fi
+
+permission=$(ls -lde "$APP_FOLDER")
+echo "$permission">>"$LOG_PATH"
+
+echo "["$(date)"]use this app path: $APP_PATH">>"$LOG_PATH"
+echo "["$(date)"]use this folder path: $APP_FOLDER">>"$LOG_PATH"
+echo "["$(date)"]use this dock path: $DOCK_APPPATH">>"$LOG_PATH"
+
+#kill running app
+killzoom
+
+install_app_to_path "$APP_FOLDER"
+ret=$?
+if [[ $ret != 0 ]] ; then
+    if [ $isAdmin = 0 ] ; then
+        echo "install failed with error: $ret">>"$LOG_PATH"
+        exit $ret
+    else
+        if [[ ! -d  "$USER_APP_FOLDER" ]] ; then
+            mkdir -p "$USER_APP_FOLDER"
+            echo "$USER_APP_FOLDER:create folder, use it">>"$LOG_PATH"
+        else
+            echo "$USER_APP_FOLDER:folder exists, use it">>"$LOG_PATH"
+        fi
+
+        APP_PATH="$USER_APP_PATH"
+        APP_FOLDER="$USER_APP_FOLDER"
+        DOCK_APPPATH="$USER_DOCK_PATH"
+
+        echo "["$(date)"]change to normal path: $APP_PATH">>"$LOG_PATH"
+        echo "["$(date)"]change to this dock path: $DOCK_APPPATH">>"$LOG_PATH"
+        install_app_to_path "$APP_FOLDER"
+        ret=$?
+        if [[ $ret != 0 ]] ; then
+            echo "install failed with error: $ret">>"$LOG_PATH"
+            exit $ret
+        fi
+    fi
+fi
+
+cd "$APP_PATH/.."
+installedPath="$(pwd)"
+cd -
+
+cat .zoom.us.applist.txt | while read line
+do
+    cd "$line/.."
+    shouldDeletePath="$(pwd)"
+    if [[ -w "$line/../zoom.us.app" ]] ; then
+        if [[ "$shouldDeletePath" != "$installedPath" ]] ; then
+            echo "Delet $shouldDeletePath while installed:$installedPath">>"$LOG_PATH"
+            rm -rf "$line/../zoom.us.app"&
+        fi
+    fi
+    cd -
+done
+rm .zoom.us.applist.txt
+
+
+#######################################################################{
+#if zoom app had been installed into /Applications then cover it
+if [[ -d "$GLOBAL_APP_PATH" && "$APP_PATH" != "$GLOBAL_APP_PATH" ]]; then
+    ./zoomAutenticationTool ./runwithroot "$APP_PATH" "$GLOBAL_APP_PATH"
+    if [[ ! -d "$APP_PATH" ]]; then
+        APP_PATH="$GLOBAL_APP_PATH"
+        DOCK_APPPATH="$GLOBAL_DOCK_PATH"
+    fi
+fi
+#########}
+
+echo "["$(date)"]remove previous install plugin: $isAdmin">>"$LOG_PATH"
+#remove previous installed plugin
+if [ $isAdmin = 1 ] ; then
+    rm -rf /Library/Internet\ Plug-Ins/ZoomUsPlugIn.plugin
+fi
+
+rm -rf ~/Library/Internet\ Plug-Ins/ZoomUsPlugIn.plugin
+echo "["$(date)"]result of remove zoom plugin: $?">>"$LOG_PATH"
+if [ ! -d  ~/Library/Internet\ Plug-Ins ] ; then
+    mkdir ~/Library/Internet\ Plug-Ins
+fi
+
+mv -f ZoomUsPlugIn.plugin ~/Library/Internet\ Plug-Ins/
+echo "["$(date)"]result of copy zoom plugin: $?">>"$LOG_PATH"
+
+touch ~/Library/Internet\ Plug-Ins/ZoomUsPlugIn.plugin
+chmod 755 ~/Library/Internet\ Plug-Ins/ZoomUsPlugIn.plugin
+
+echo "parent id: $PPID">>"$LOG_PATH"
+
+#save install path to default
+defaults write us.zoom.xos installPath "$APP_PATH"
+echo "["$(date)"]defaults write installPath:$APP_PATH  ret=$?">>"$LOG_PATH"
+
+keepIconInDock
+echo "["$(date)"]keepIconInDock: $?">>"$LOG_PATH"
+###########################
+#ZOOM-59224
+OnlinePlugins=~/Library/Application\ Support/zoom.us/Plugins
+rm -rf "$OnlinePlugins"
+if [[ ! -d "$OnlinePlugins" ]]; then
+    mkdir -p "$OnlinePlugins"
+    if [[ $(whoami) == "root" ]] ; then
+        chown :staff "$OnlinePlugins"
+        chmod g+w "$OnlinePlugins"
+        chown :staff ~/Library/Application\ Support/zoom.us
+        chmod g+w ~/Library/Application\ Support/zoom.us
+    fi
+fi
+###########################
+
+###############################
+#if os > 10.10 delete ZoomAudioDevice.kext
+ver=$(sw_vers -productVersion)
+majorver=$(sw_vers -productVersion | cut -d "." -f 1);
+minorver=$(sw_vers -productVersion | cut -d "." -f 2);
+
+if [[ $minorver -gt 9 ]] ; then
+    rm -rf "$APP_PATH/Contents/Plugins/ZoomAudioDevice.kext"
+###########################
+#ZOOM-59224
+else
+    mv -f ZoomAudioDevice.kext "$OnlinePlugins"
+###########################
+fi
+echo "["$(date)"]OnlinePlugins installed">>"$LOG_PATH"
+
+#md_verify
+
+codesign_verify
+
+#start new app
+open "$APP_PATH"&
+echo "["$(date)"] start new app: $APP_PATH">>"$LOG_PATH"
+
+#kill installer
+kill_installer
+
+exit 0
